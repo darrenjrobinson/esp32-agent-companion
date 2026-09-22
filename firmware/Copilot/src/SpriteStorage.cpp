@@ -140,11 +140,13 @@ void initializeSdSpriteStorage() {
     return;
   }
   if (!SD_MMC.begin("/sdcard", true, false, kSdFrequencyKhz, 2)) {
+    SD_MMC.end();
     storageState("mount_failed", "Card absent or filesystem could not mount; no formatting attempted.");
     return;
   }
   const auto type = SD_MMC.cardType();
   if (type == CARD_NONE) {
+    SD_MMC.end();
     storageState("mount_failed", "No card detected; using flash.");
     return;
   }

@@ -34,6 +34,46 @@ sprite SHA256 before animation starts. There is no OTA slot or flash filesystem;
 the optional microSD filesystem is used only for reading.
 This replaces the earlier 11 MiB application layout that embedded all artwork.
 
+### 16 MiB is a hard ceiling, even on a 32 MB board
+
+Some boards carry 32 MB of flash rather than 16 MB. **It does not help.** The
+firmware can only *read* the low 16 MiB: the runtime cache addresses flash with
+24 bits, so anything at or above `0x1000000` wraps back to offset 0.
+
+This was measured on hardware. A payload placed at `0xFF0000`, crossing the line
+64 KB in, flashed and verified cleanly and even mapped successfully, but the
+mapped bytes past the boundary were wrong -- the read at physical `0x1000000`
+returned the bootloader's `0xe9` image magic instead of the payload.
+
+**esptool cannot catch this.** Its stub does its own 4-byte addressing, so a
+write to the upper half succeeds and `Hash of data verified` prints happily.
+Only the running firmware sees the wrap, so verify any new partition by reading
+it back *on the device*.
+
+The cause is that Arduino's ESP32 core ships precompiled ESP-IDF libraries built
+with `CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y`. Its sdkconfig has
+`SOC_SPI_MEM_SUPPORT_CACHE_32BIT_ADDR_MAP=y`, so the hardware is capable, but
+nothing enables it; `boards.txt` offering `FlashSize=32M` and esptool's
+`--flash-size 32MB` only change the bootloader header. The MMU is not the
+binding constraint -- `SOC_MMU_ENTRY_NUM` is 512 entries of 64 KB, and two
+~9.5 MB packs plus PSRAM and the application measured about 448 of them and
+mapped without complaint. The data was simply wrong.
+
+`tools/embed_sprites.py` and `tools/firmware_artifacts.py` therefore bound the
+layout at 16 MiB so an oversized partition is rejected at export time rather
+than on the device.
+
+### Starting the SD host can disable touch
+
+On at least one board revision, bringing up `SD_MMC` leaves the CST9217 touch
+controller's I2C bus in `ESP_ERR_INVALID_STATE`; every later `getPoint()` fails
+and touch stops for the rest of the power cycle. The controller cannot be
+recovered afterwards -- detaching the interrupt, calling `Wire.end()` and
+re-running initialisation all fail. The pin sets do not overlap (touch on
+SDA 15 / SCL 14, SD on CLK 2 / CMD 1 / D0 3), so this looks like a peripheral
+conflict rather than wiring. If a board shows touch dying the moment an
+SD-backed character is selected, this is why.
+
 The scripts use the existing Arduino IDE CLI, its configuration, and Waveshare's
 bundled GFX library. Overrides: `ARDUINO_CLI`, `ARDUINO_CONFIG`, `WAVESHARE_DIR`.
 Do not substitute a generic display library: the vendor version includes the

@@ -15,6 +15,12 @@ import platform
 
 ROOT = Path(__file__).resolve().parents[1]
 REGENERATE = "Regenerate with: python3 tools/export_sprite_firmware.py"
+# Some boards carry 32 MB, but the firmware can only READ the low 16 MiB: the
+# runtime cache addresses flash with 24 bits, so anything at or above 16 MiB
+# wraps back to offset 0. esptool writes and verifies the upper half happily,
+# which makes an oversized layout look fine until the device reads it. Keeping
+# the bound here rejects it at export time instead. See docs/development.md.
+FLASH_BYTES = 16 * 1024 * 1024
 IDLE_MANIFEST = "web/generated-sprites/animation.json"
 EXPRESSION_MANIFEST = "web/generated-expressions/animation.json"
 IDLE_DIRECTIONS = ("right", "left", "up", "down", "up_right", "up_left",
@@ -60,7 +66,7 @@ def read_assets_partition(root=ROOT):
     except ValueError as error:
         raise ValueError("Invalid assets partition type, subtype, offset, or size.") from error
     if (not valid_type or not valid_subtype or offset < 0x10000 or offset % 0x10000
-            or size <= 0 or size % 4096 or offset + size > 16 * 1024 * 1024):
+            or size <= 0 or size % 4096 or offset + size > FLASH_BYTES):
         raise ValueError("Invalid assets data partition bounds/type; require subtype 0x40 within 16 MiB flash.")
     for row in rows:
         if row[0] == name or len(row) < 5 or not row[3]:
