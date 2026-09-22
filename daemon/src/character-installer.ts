@@ -7,10 +7,27 @@ import {spawn} from 'node:child_process';
 import {SerialPort} from 'serialport';
 import {isLikelyEsp32Port} from './usb-transport.js';
 
-const protocol = 2;
+// Bumped with the third character slot, which added its own upload trigger.
+const protocol = 3;
+
+// Each installable character is a display name and the byte that asks the
+// device to start receiving its pack; everything else about the upload is
+// identical, so the installer is shared.
+const characters = {
+  openclaw: {name: 'OpenClaw', trigger: 'u'},
+  jarvis: {name: 'Jarvis', trigger: 'w'},
+} as const;
+
+export type InstallableCharacter = keyof typeof characters;
+
+export function isInstallableCharacter(value: string): value is InstallableCharacter {
+  return Object.hasOwn(characters, value);
+}
 const label = 'com.danwahlin.esp32-agent-companion';
 
-export async function installOpenClaw(file: string, preferredPort?: string): Promise<void> {
+export async function installCharacter(
+    character: InstallableCharacter, file: string, preferredPort?: string): Promise<void> {
+  const {name, trigger} = characters[character];
   const details = await stat(file);
   if (!details.isFile() || details.size <= 0) throw new Error(`Character pack is empty: ${file}`);
   const resumeDaemon = await pauseDaemon();
@@ -28,12 +45,12 @@ export async function installOpenClaw(file: string, preferredPort?: string): Pro
 
       const readyResponse = lines.wait(
         line => line.startsWith('UPLOAD_READY ') || line.startsWith('UPLOAD_ERROR '), 10000);
-      await write(port, 'u');
+      await write(port, trigger);
       const ready = await readyResponse;
       if (ready.startsWith('UPLOAD_ERROR ')) throw new Error(ready);
       const match = /\bbytes=(\d+)\b/.exec(ready);
       if (!match || Number(match[1]) !== details.size)
-        throw new Error(`Device expects a different OpenClaw pack: ${ready}`);
+        throw new Error(`Device expects a different ${name} pack: ${ready}`);
 
       const hash = createHash('sha256');
       let sent = 0;
@@ -59,7 +76,7 @@ export async function installOpenClaw(file: string, preferredPort?: string): Pro
         const percent = Math.floor(sent * 100 / details.size);
         if (percent >= shown + 5 || percent === 100) {
           shown = percent;
-          process.stderr.write(`\rUploading OpenClaw: ${percent}%`);
+          process.stderr.write(`\rUploading ${name}: ${percent}%`);
         }
       }
       process.stderr.write('\n');

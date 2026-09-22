@@ -23,13 +23,13 @@ bool inflate(uint8_t* output, size_t outputSize, const uint8_t*, size_t inputSiz
 }
 
 namespace copilot {
-SpriteBlockLease acquireOpenClawBlock(size_t, size_t bytes) {
+SpriteBlockLease acquireSdCharacterBlock(size_t, size_t bytes) {
   return bytes ? SpriteBlockLease{&source, -1} : SpriteBlockLease{nullptr, -1};
 }
 
-void releaseOpenClawBlock(const SpriteBlockLease&) {}
+void releaseSdCharacterBlock(const SpriteBlockLease&) {}
 
-void prefetchOpenClawBlock(size_t offset, size_t bytes) {
+void prefetchSdCharacterBlock(size_t offset, size_t bytes) {
   prefetched.emplace_back(offset, bytes);
 }
 }

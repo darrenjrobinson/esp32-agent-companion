@@ -29,7 +29,8 @@ int main() {
   menu.setSoundVolume(255);
   assert(menu.soundVolume() == 100);
   assert(menu.tap(100, 250) == SettingsAction::CharacterCopilot);
-  assert(menu.tap(300, 250) == SettingsAction::CharacterOpenClaw);
+  assert(menu.tap(220, 250) == SettingsAction::CharacterOpenClaw);
+  assert(menu.tap(340, 250) == SettingsAction::CharacterJarvis);
   assert(menu.tap(100, 315) == SettingsAction::Idle);
   assert(menu.tap(300, 315) == SettingsAction::Working);
   assert(menu.tap(100, 350) == SettingsAction::Complete);

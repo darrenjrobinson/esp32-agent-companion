@@ -118,8 +118,8 @@ class NativeCharacterRenderer(NativeRenderer):
             raise ValueError("Character mode must be -1 (unchanged) or 0..5.")
         if type(playing) is not bool:
             raise ValueError("playing must be a boolean.")
-        if character not in ("copilot", "openclaw"):
-            raise ValueError("Character must be copilot or openclaw.")
+        if character not in ("copilot", "openclaw", "jarvis"):
+            raise ValueError("Character must be copilot, openclaw, or jarvis.")
         if type(direction) is not int or not -1 <= direction <= 7:
             raise ValueError("Direction must be -1 (automatic) or 0..7.")
         if not self.lock.acquire(blocking=False):
@@ -127,7 +127,7 @@ class NativeCharacterRenderer(NativeRenderer):
         try:
             if self.process.poll() is not None:
                 raise RuntimeError("Character renderer is no longer running.")
-            character_id = 0 if character == "copilot" else 1
+            character_id = {"copilot": 0, "openclaw": 1, "jarvis": 2}[character]
             self.process.stdin.write(
                 f"{delta:.12f} {mode} {int(playing)} {character_id} {direction}\n".encode("ascii"))
             deadline = time.monotonic() + 5

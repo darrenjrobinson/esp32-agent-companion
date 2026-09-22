@@ -12,7 +12,8 @@ from scipy.ndimage import binary_dilation, binary_fill_holes, label, find_object
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def prepare_track(source, direction="right", center=None, destination=None, prefix=None, isolate_colored_heads=False):
+def prepare_track(source, direction="right", center=None, destination=None, prefix=None, isolate_colored_heads=False,
+                   contact_dir=None, dilate_iterations=0):
     sheet = Image.open(source).convert("RGB")
     if sheet.size != (1536, 1024):
         raise ValueError("Unexpected sprite-sheet dimensions.")
@@ -25,7 +26,8 @@ def prepare_track(source, direction="right", center=None, destination=None, pref
     foreground = pixels.max(axis=2) > 32
     if isolate_colored_heads:
         foreground &= pixels.max(axis=2).astype(int) - pixels.min(axis=2) > 20
-    labels, _ = label(foreground)
+    grouping = binary_dilation(foreground, iterations=dilate_iterations) if dilate_iterations else foreground
+    labels, _ = label(grouping)
     objects = []
     identities = {}
     for ident, box in enumerate(find_objects(labels), 1):
@@ -84,7 +86,8 @@ def prepare_track(source, direction="right", center=None, destination=None, pref
     contact = Image.new("RGB", (6 * 240, 4 * 224))
     for i, cell in enumerate(cells):
         contact.paste(cell, ((i % 6) * 240, (i // 6) * 224))
-    contact.save(ROOT / f"assets/generated-sprites/{direction}-turn-crops.png")
+    contact_dir = contact_dir or ROOT / "assets/generated-sprites"
+    contact.save(contact_dir / f"{direction}-turn-crops.png")
     print(f"Prepared {len(frames)} rigidly registered {direction} sprite cells.")
     return manifest
 

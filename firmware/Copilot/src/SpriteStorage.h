@@ -1,4 +1,5 @@
 #pragma once
+#include "Character.h"
 #include <cstddef>
 #include <cstdint>
 
@@ -19,14 +20,18 @@ struct SdSpriteStatus {
   uint32_t cacheBytes, hits, misses, revision;
 };
 
-// Optional, read-only boot initialization. Errors leave the verified flash source active.
-void initializeSdSpriteStorage();
 SdSpriteStatus sdSpriteStatus();
-bool openClawAvailable();
-bool prepareOpenClawUpdate();
 SpriteBlockLease acquireSpriteBlock(size_t offset, size_t bytes);
 void releaseSpriteBlock(const SpriteBlockLease& block);
-SpriteBlockLease acquireOpenClawBlock(size_t offset, size_t bytes);
-void prefetchOpenClawBlock(size_t offset, size_t bytes);
-void releaseOpenClawBlock(const SpriteBlockLease& block);
+
+// SD-streamed characters (OpenClaw, Jarvis) share a single resident pack
+// slot: only one such character's pack is ever loaded at a time, and
+// loading a different one closes the previous pack first. Copilot itself
+// has no SD pack; loading it clears whatever pack was active.
+void loadSdCharacterPack(CharacterId character);
+bool sdCharacterAvailable();
+bool prepareSdCharacterUpdate();
+SpriteBlockLease acquireSdCharacterBlock(size_t offset, size_t bytes);
+void prefetchSdCharacterBlock(size_t offset, size_t bytes);
+void releaseSdCharacterBlock(const SpriteBlockLease& block);
 }

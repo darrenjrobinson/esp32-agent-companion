@@ -1,6 +1,7 @@
 'use strict';
 (() => {
   const names = ['Idle', 'Surprise', 'Working', 'Complete', 'Needs attention', 'Sleeping'];
+  const characterLabels = {copilot: 'Copilot', openclaw: 'OpenClaw', jarvis: 'Jarvis'};
   const characterStorageKey = 'agent-companion.character-lab.character';
   const characterCookie = 'agent_companion_character';
   const session = crypto.randomUUID();
@@ -21,13 +22,13 @@
   function savedCharacter() {
     try {
       const value = localStorage.getItem(characterStorageKey);
-      if (value === 'copilot' || value === 'openclaw') return value;
+      if (value in characterLabels) return value;
     } catch {
       // Fall through to the cookie when browser storage is unavailable.
     }
     const cookie = document.cookie.split('; ').find(value =>
       value.startsWith(`${characterCookie}=`))?.split('=')[1];
-    return cookie === 'copilot' || cookie === 'openclaw' ? cookie : null;
+    return cookie in characterLabels ? cookie : null;
   }
   function saveCharacter(value) {
     try {
@@ -79,9 +80,9 @@
       dirty = true;
       due = performance.now();
       document.getElementById('character').setAttribute(
-        'aria-label', `Surprise ${character === 'openclaw' ? 'OpenClaw' : 'Copilot'}`);
+        'aria-label', `Surprise ${characterLabels[character]}`);
       document.getElementById('status').textContent =
-        `${character === 'openclaw' ? 'OpenClaw' : 'Copilot'} selected. Motion state preserved.`;
+        `${characterLabels[character]} selected. Motion state preserved.`;
     });
   });
   document.addEventListener('keydown', event => {
@@ -140,6 +141,8 @@
       document.getElementById('connection').textContent = playing ? 'Live · 30 Hz target' : 'Paused';
       document.getElementById('assets').textContent = character === 'openclaw'
         ? 'All 13 OpenClaw tracks are pre-rendered 3D sprites, including both attention tilts.'
+        : character === 'jarvis'
+        ? 'All 13 Jarvis tracks are pre-rendered AI-generated sprites, including both attention tilts.'
         : Number(value('availableDirections')) >= 13
         ? 'All 13 native Copilot tracks are available, including both attention tilts. Original artwork is retained.'
         : 'Expression artwork is incomplete. Re-export all 13 tracks before requesting expression modes.';

@@ -127,7 +127,7 @@ class CharacterPreviewTests(unittest.TestCase):
     def test_native_protocol_rejects_malformed_commands_without_desync(self):
         renderer = self.create()
         for line in (b"nan -1 1 0 -1\n", b"0 4 9 0 -1\n", b"0 1e90 1 0 -1\n",
-                     b"0 0.5 1 0 -1\n", b"0 -1 1 2 -1\n", b"0 -1 1 0 8\n",
+                     b"0 0.5 1 0 -1\n", b"0 -1 1 3 -1\n", b"0 -1 1 0 8\n",
                      b"0 -1 1 0 -1 extra\n", b"hello\n"):
             renderer.process.stdin.write(line)
             self.assertTrue(select.select([renderer.process.stdout], [], [], 5)[0])

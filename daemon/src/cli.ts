@@ -2,7 +2,7 @@
 import {runDaemon} from './daemon.js';
 import {requestDaemon} from './client.js';
 import {characterStates, hookEvents, type HookEvent, type HookPayload} from './protocol.js';
-import {installOpenClaw} from './character-installer.js';
+import {installCharacter, isInstallableCharacter} from './character-installer.js';
 
 async function main(): Promise<void> {
   const [command, argument, file, ...options] = process.argv.slice(2);
@@ -28,15 +28,16 @@ async function main(): Promise<void> {
     }
     return;
   }
-  if (command === 'install-character' && argument === 'openclaw' && file) {
+  if (command === 'install-character' && argument && isInstallableCharacter(argument) && file) {
     const portIndex = options.indexOf('--port');
     const port = portIndex >= 0 ? options[portIndex + 1] : undefined;
     if (portIndex >= 0 && !port) throw new Error('--port requires a serial device path.');
-    await installOpenClaw(file, port);
+    await installCharacter(argument, file, port);
     return;
   }
   throw new Error(
-    'Usage: agent-companion {daemon|status|send STATE|hook EVENT|install-character openclaw FILE [--port PATH]}');
+    'Usage: agent-companion {daemon|status|send STATE|hook EVENT|'
+    + 'install-character {openclaw|jarvis} FILE [--port PATH]}');
 }
 
 async function readStdin(): Promise<string> {

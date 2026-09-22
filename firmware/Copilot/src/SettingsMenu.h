@@ -10,6 +10,7 @@ enum class SettingsAction : uint8_t {
   SoundUp,
   CharacterCopilot,
   CharacterOpenClaw,
+  CharacterJarvis,
   Idle,
   Surprise,
   Working,
@@ -50,8 +51,9 @@ class SettingsMenu {
       soundVolume_ = soundVolume_ < 75 ? soundVolume_ + 25 : 100;
       return SettingsAction::SoundUp;
     }
-    if (inside(x, y, 58, 244, 165, 34)) return SettingsAction::CharacterCopilot;
-    if (inside(x, y, 243, 244, 165, 34)) return SettingsAction::CharacterOpenClaw;
+    if (inside(x, y, 58, 244, 108, 34)) return SettingsAction::CharacterCopilot;
+    if (inside(x, y, 179, 244, 108, 34)) return SettingsAction::CharacterOpenClaw;
+    if (inside(x, y, 300, 244, 108, 34)) return SettingsAction::CharacterJarvis;
     if (inside(x, y, 58, 306, 165, 34)) return SettingsAction::Idle;
     if (inside(x, y, 243, 306, 165, 34)) return SettingsAction::Working;
     if (inside(x, y, 58, 344, 165, 34)) return SettingsAction::Complete;

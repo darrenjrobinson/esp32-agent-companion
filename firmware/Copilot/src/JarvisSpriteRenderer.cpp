@@ -1,8 +1,8 @@
-#include "OpenClawSpriteRenderer.h"
+#include "JarvisSpriteRenderer.h"
 #include "Character.h"
 #include "Config.h"
 #include "SpriteStorage.h"
-#include "../generated/openclaw_assets.h"
+#include "../generated/jarvis_assets.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -12,64 +12,64 @@ namespace {
 constexpr size_t kPixels = static_cast<size_t>(kCharacterFrameWidth) * kFrameHeight;
 }
 
-bool OpenClawSpriteRenderer::decode(unsigned blockIndex, uint16_t* output) {
-  if (blockIndex >= sizeof(kOpenClawFrames) / sizeof(kOpenClawFrames[0])) {
-    error_ = "OpenClaw sprite block index is invalid.";
+bool JarvisSpriteRenderer::decode(unsigned blockIndex, uint16_t* output) {
+  if (blockIndex >= sizeof(kJarvisFrames) / sizeof(kJarvisFrames[0])) {
+    error_ = "Jarvis sprite block index is invalid.";
     return false;
   }
-  const auto block = kOpenClawFrames[blockIndex];
+  const auto block = kJarvisFrames[blockIndex];
   const auto source = acquireSdCharacterBlock(block.offset, block.size);
   if (!source.data) {
-    error_ = "OpenClaw SD sprite source is unavailable.";
+    error_ = "Jarvis SD sprite source is unavailable.";
     return false;
   }
   const bool decoded = block.size && inflate_(
       reinterpret_cast<uint8_t*>(output), kPixels * sizeof(uint16_t),
       source.data, block.size, kCharacterFrameWidth, kCharacterFrameWidth);
   releaseSdCharacterBlock(source);
-  if (!decoded) error_ = "OpenClaw sprite decompression failed.";
+  if (!decoded) error_ = "Jarvis sprite decompression failed.";
   return decoded;
 }
 
-void OpenClawSpriteRenderer::prefetch(
+void JarvisSpriteRenderer::prefetch(
     unsigned direction, unsigned index, unsigned blinkLevel) {
-  if (direction >= kOpenClawDirections || index >= kOpenClawSteps
-      || blinkLevel >= kOpenClawBlinkLevels) return;
-  const auto block = kOpenClawFrames[
-      (direction * kOpenClawSteps + index) * kOpenClawBlinkLevels + blinkLevel];
+  if (direction >= kJarvisDirections || index >= kJarvisSteps
+      || blinkLevel >= kJarvisBlinkLevels) return;
+  const auto block = kJarvisFrames[
+      (direction * kJarvisSteps + index) * kJarvisBlinkLevels + blinkLevel];
   prefetchSdCharacterBlock(block.offset, block.size);
 }
 
-bool OpenClawSpriteRenderer::render(
+bool JarvisSpriteRenderer::render(
     const SpritePose& pose, float effectSeconds, uint16_t* frame) {
   error_ = nullptr;
   if (!scratch_ || !cached_ || !inflate_ || !frame) {
-    error_ = "OpenClaw renderer requires initialized buffers.";
+    error_ = "Jarvis renderer requires initialized buffers.";
     return false;
   }
-  if (pose.direction >= kOpenClawDirections || pose.index >= kOpenClawSteps
-      || pose.blinkLevel >= kOpenClawBlinkLevels
-      || (pose.blinkBlend && pose.blinkLevel + 1 >= kOpenClawBlinkLevels)
+  if (pose.direction >= kJarvisDirections || pose.index >= kJarvisSteps
+      || pose.blinkLevel >= kJarvisBlinkLevels
+      || (pose.blinkBlend && pose.blinkLevel + 1 >= kJarvisBlinkLevels)
       || !std::isfinite(effectSeconds) || effectSeconds < 0) {
-    error_ = "Invalid OpenClaw sprite pose.";
+    error_ = "Invalid Jarvis sprite pose.";
     return false;
   }
   constexpr int top = (kCharacterFrameHeight - kFrameHeight) / 2;
-  unsigned index = pose.index;
-  if (pose.direction == 9)
-    index = 1 + static_cast<unsigned>(std::fmod(effectSeconds * kOpenClawWalkFps, 23));
-  const unsigned frameIndex = pose.direction * kOpenClawSteps + index;
-  const unsigned blockIndex = frameIndex * kOpenClawBlinkLevels + pose.blinkLevel;
+  // Unlike OpenClaw's "working" track, Jarvis's art is static-per-pose (no
+  // baked-in walk cycle), so the requested index is used directly.
+  const unsigned index = pose.index;
+  const unsigned frameIndex = pose.direction * kJarvisSteps + index;
+  const unsigned blockIndex = frameIndex * kJarvisBlinkLevels + pose.blinkLevel;
   const uint32_t key = blockIndex * 256 + pose.blinkBlend;
   const auto prefetchUpcomingBlink = [&]() {
     if (!pose.blinkLevel && !pose.blinkBlend) {
-      const unsigned last = index == 0 ? kOpenClawBlinkLevels - 1 : 1;
+      const unsigned last = index == 0 ? kJarvisBlinkLevels - 1 : 1;
       for (unsigned blink = 1; blink <= last; ++blink)
         prefetch(pose.direction, index, blink);
       return;
     }
     prefetch(pose.direction, index, std::min<unsigned>(
-        kOpenClawBlinkLevels - 1, pose.blinkLevel + (pose.blinkBlend ? 2 : 1)));
+        kJarvisBlinkLevels - 1, pose.blinkLevel + (pose.blinkBlend ? 2 : 1)));
   };
   if (cacheKey_ == key) {
     std::memcpy(frame, cached_,

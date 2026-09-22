@@ -32,6 +32,11 @@ built-in character.
 - **Optional OpenClaw character:** a validated microSD sprite pack, read-only during
   normal operation, can be selected from Settings, with built-in Copilot assets as
   the automatic fallback.
+- **A third character slot, left empty for you:** the firmware, settings menu,
+  renderer, pack exporter and installer for a third character are all in place,
+  but no artwork ships for it. Generate your own and the slot picks it up — see
+  [creating your own character's art](docs/character-art-notes.md) for the whole
+  pipeline, from reference image through prompts to a finished 13-track pack.
 
 The character works immediately in automatic Idle mode. Agent states can be
 controlled through USB serial commands, the swipe-up settings menu, or the
@@ -271,6 +276,7 @@ locally and ignored.
 
 - [Build from source](docs/build-from-source.md)
 - [Development, preview, hardware, and serial commands](docs/development.md)
+- [Creating your own character's art](docs/character-art-notes.md)
 - [Tagging and publishing releases](docs/releases.md)
 
 This is an independent project, not an official GitHub or Waveshare product.

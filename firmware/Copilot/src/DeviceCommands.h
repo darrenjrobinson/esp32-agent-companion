@@ -5,10 +5,10 @@
 
 namespace copilot {
 enum class DeviceCommand {
-  None, Invalid, Capture, Heap, Info, UploadOpenClaw,
+  None, Invalid, Capture, Heap, Info, UploadOpenClaw, UploadJarvis,
   Idle, Surprise, Working, Complete, Attention
 };
-constexpr unsigned kDeviceProtocol = 2;
+constexpr unsigned kDeviceProtocol = 3;
 
 inline const char* commandName(DeviceCommand command) {
   switch (command) {
@@ -36,6 +36,7 @@ class DeviceCommands {
       if (byte == 'h') return DeviceCommand::Heap;
       if (byte == 'i') return DeviceCommand::Info;
       if (byte == 'u') return DeviceCommand::UploadOpenClaw;
+      if (byte == 'w') return DeviceCommand::UploadJarvis;
       return byte == '\r' || byte == '\n' ? DeviceCommand::None : DeviceCommand::Invalid;
     }
     previous_ = milliseconds;

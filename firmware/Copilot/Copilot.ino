@@ -13,6 +13,7 @@
 #include <atomic>
 #include "src/SpriteRenderer.h"
 #include "src/OpenClawSpriteRenderer.h"
+#include "src/JarvisSpriteRenderer.h"
 #include "src/SpritePredictor.h"
 #include "src/SpriteStorage.h"
 #include "src/Character.h"
@@ -24,6 +25,7 @@
 #include "src/SettingsMenu.h"
 #include "src/Motion.h"
 #include "generated/openclaw_assets.h"
+#include "generated/jarvis_assets.h"
 
 using namespace copilot;
 
@@ -34,6 +36,7 @@ QueueHandle_t freeFrames, readyFrames, commands;
 TaskHandle_t renderTask;
 SpriteRenderer* copilotRenderer;
 OpenClawSpriteRenderer* openClawRenderer;
+JarvisSpriteRenderer* jarvisRenderer;
 CharacterEffects* effects;
 tinfl_decompressor inflater;
 alignas(4) uint8_t inflateHistory[TINFL_LZ_DICT_SIZE];
@@ -44,9 +47,12 @@ uint8_t* transferBuffer;
 std::atomic<uint32_t> droppedLogs{0};
 std::atomic<uint8_t> activeCharacter{static_cast<uint8_t>(CharacterId::Copilot)};
 std::atomic<uint8_t> selectedCharacter{static_cast<uint8_t>(CharacterId::Copilot)};
-portMUX_TYPE openClawRenderLock = portMUX_INITIALIZER_UNLOCKED;
-uint32_t openClawRenders = 0;
-bool openClawUploadPending = false;
+// Guards whichever SD-streamed character (OpenClaw or Jarvis) is currently
+// rendering; only one is ever active at a time under the single-pack-slot
+// SpriteStorage design.
+portMUX_TYPE sdRenderLock = portMUX_INITIALIZER_UNLOCKED;
+uint32_t sdRenders = 0;
+bool sdUploadPending = false;
 uint32_t worstPresentationGap = 0;
 bool captureInterrupted = false;
 SettingsMenu settings(kBrightness);
@@ -173,29 +179,32 @@ void animate(void*) {
     inflateTimeUs = predictTimeUs = 0;
     const CharacterId character = static_cast<CharacterId>(
         activeCharacter.load(std::memory_order_relaxed));
-    bool renderOpenClaw = false;
-    if (character == CharacterId::OpenClaw) {
-      portENTER_CRITICAL(&openClawRenderLock);
-      if (!openClawUploadPending) {
-        ++openClawRenders;
-        renderOpenClaw = true;
+    const bool sdCharacter = character == CharacterId::OpenClaw || character == CharacterId::Jarvis;
+    bool renderSdCharacter = false;
+    if (sdCharacter) {
+      portENTER_CRITICAL(&sdRenderLock);
+      if (!sdUploadPending) {
+        ++sdRenders;
+        renderSdCharacter = true;
       }
-      portEXIT_CRITICAL(&openClawRenderLock);
+      portEXIT_CRITICAL(&sdRenderLock);
     }
-    bool rendered = renderOpenClaw && openClawAvailable()
-        && openClawRenderer->render(
-            frame->state.pose, frame->state.effectSeconds, frame->pixels);
-    if (renderOpenClaw) {
-      portENTER_CRITICAL(&openClawRenderLock);
-      --openClawRenders;
-      portEXIT_CRITICAL(&openClawRenderLock);
+    bool rendered = renderSdCharacter && sdCharacterAvailable()
+        && (character == CharacterId::OpenClaw
+            ? openClawRenderer->render(frame->state.pose, frame->state.effectSeconds, frame->pixels)
+            : jarvisRenderer->render(frame->state.pose, frame->state.effectSeconds, frame->pixels));
+    if (renderSdCharacter) {
+      portENTER_CRITICAL(&sdRenderLock);
+      --sdRenders;
+      portEXIT_CRITICAL(&sdRenderLock);
     }
-    if (character == CharacterId::OpenClaw && !rendered) {
+    if (sdCharacter && !rendered) {
       activeCharacter.store(static_cast<uint8_t>(CharacterId::Copilot), std::memory_order_relaxed);
       selectedCharacter.store(static_cast<uint8_t>(CharacterId::Copilot), std::memory_order_relaxed);
       copilotRenderer->invalidate();
-      logMessage("CHARACTER fallback=copilot reason=%s\n",
-                 openClawRenderer->error() ? openClawRenderer->error() : "SD unavailable");
+      const char* renderError = character == CharacterId::OpenClaw
+          ? openClawRenderer->error() : jarvisRenderer->error();
+      logMessage("CHARACTER fallback=copilot reason=%s\n", renderError ? renderError : "SD unavailable");
     }
     if (character == CharacterId::Copilot || !rendered)
       rendered = copilotRenderer->render(frame->state.pose, frame->pixels);
@@ -347,13 +356,15 @@ CharacterId loadCharacter() {
   const uint8_t stored = preferences.getUChar(
       kCharacterPreference, static_cast<uint8_t>(CharacterId::Copilot));
   preferences.end();
-  if (stored > static_cast<uint8_t>(CharacterId::OpenClaw)) {
+  if (stored > static_cast<uint8_t>(CharacterId::Jarvis)) {
     logMessage("SETTINGS_ERROR invalid character=%u\n", static_cast<unsigned>(stored));
     return CharacterId::Copilot;
   }
   const CharacterId character = static_cast<CharacterId>(stored);
-  if (character == CharacterId::OpenClaw && !openClawAvailable()) {
-    logMessage("CHARACTER stored=openclaw unavailable; using=copilot\n");
+  loadSdCharacterPack(character);
+  if ((character == CharacterId::OpenClaw || character == CharacterId::Jarvis)
+      && !sdCharacterAvailable()) {
+    logMessage("CHARACTER stored=%s unavailable; using=copilot\n", characterName(character));
     return CharacterId::Copilot;
   }
   return character;
@@ -374,47 +385,76 @@ void sendUploadMessage(const char* message) {
   writeCapture(reinterpret_cast<const uint8_t*>(message), std::strlen(message));
 }
 
-void restartAfterUploadError(const char* message) {
-  SD_MMC.remove(kOpenClawTempPath);
+void restartAfterUploadError(const char* tempPath, const char* message) {
+  SD_MMC.remove(tempPath);
   sendUploadMessage(message);
   delay(250);
   ESP.restart();
 }
 
-void installOpenClawFromUsb() {
-  portENTER_CRITICAL(&openClawRenderLock);
-  openClawUploadPending = true;
+struct UsbCharacterPack {
+  const char* tempPath;
+  const char* spritePath;
+  const char* backupPath;
+  uint32_t dataSize;
+  const uint8_t* dataSha256;
+};
+
+const UsbCharacterPack* usbPackFor(CharacterId character) {
+  static constexpr UsbCharacterPack openClaw{
+      kOpenClawTempPath, kOpenClawSpritePath, kOpenClawBackupPath,
+      kOpenClawDataSize, kOpenClawDataSha256};
+  static constexpr UsbCharacterPack jarvis{
+      kJarvisTempPath, kJarvisSpritePath, kJarvisBackupPath,
+      kJarvisDataSize, kJarvisDataSha256};
+  switch (character) {
+    case CharacterId::OpenClaw: return &openClaw;
+    case CharacterId::Jarvis: return &jarvis;
+    default: return nullptr;
+  }
+}
+
+void installSdCharacterFromUsb(CharacterId character) {
+  const UsbCharacterPack* pack = usbPackFor(character);
+  if (!pack) {
+    sendUploadMessage("UPLOAD_ERROR unsupported_character\n");
+    return;
+  }
+  portENTER_CRITICAL(&sdRenderLock);
+  sdUploadPending = true;
   activeCharacter.store(static_cast<uint8_t>(CharacterId::Copilot), std::memory_order_relaxed);
   selectedCharacter.store(static_cast<uint8_t>(CharacterId::Copilot), std::memory_order_relaxed);
-  portEXIT_CRITICAL(&openClawRenderLock);
+  portEXIT_CRITICAL(&sdRenderLock);
   copilotRenderer->invalidate();
   const uint32_t renderStopStarted = millis();
   for (;;) {
-    portENTER_CRITICAL(&openClawRenderLock);
-    const bool stopped = openClawRenders == 0;
-    portEXIT_CRITICAL(&openClawRenderLock);
+    portENTER_CRITICAL(&sdRenderLock);
+    const bool stopped = sdRenders == 0;
+    portEXIT_CRITICAL(&sdRenderLock);
     if (stopped) break;
-    if (millis() - renderStopStarted > kOpenClawRenderStopTimeoutMs)
-      restartAfterUploadError("UPLOAD_ERROR renderer_busy\n");
+    if (millis() - renderStopStarted > kSdRenderStopTimeoutMs)
+      restartAfterUploadError(pack->tempPath, "UPLOAD_ERROR renderer_busy\n");
     delay(1);
   }
-  if (!prepareOpenClawUpdate())
-    restartAfterUploadError("UPLOAD_ERROR sd_unavailable\n");
+  if (!prepareSdCharacterUpdate())
+    restartAfterUploadError(pack->tempPath, "UPLOAD_ERROR sd_unavailable\n");
+  char directory[40];
+  snprintf(directory, sizeof(directory), "/characters/%s", characterName(character));
   SD_MMC.mkdir("/characters");
-  SD_MMC.mkdir("/characters/openclaw");
-  SD_MMC.remove(kOpenClawTempPath);
-  File output = SD_MMC.open(kOpenClawTempPath, FILE_WRITE);
+  SD_MMC.mkdir(directory);
+  SD_MMC.remove(pack->tempPath);
+  File output = SD_MMC.open(pack->tempPath, FILE_WRITE);
   if (!output || output.isDirectory())
-    restartAfterUploadError("UPLOAD_ERROR temporary_file\n");
+    restartAfterUploadError(pack->tempPath, "UPLOAD_ERROR temporary_file\n");
 
   char ready[64];
   const int readyLength = snprintf(
       ready, sizeof(ready), "UPLOAD_READY bytes=%u\n",
-      static_cast<unsigned>(kOpenClawDataSize));
+      static_cast<unsigned>(pack->dataSize));
   if (readyLength <= 0 || static_cast<size_t>(readyLength) >= sizeof(ready)
       || !writeCapture(reinterpret_cast<const uint8_t*>(ready), readyLength)) {
     output.close();
-    restartAfterUploadError("UPLOAD_ERROR usb_ready\n");
+    restartAfterUploadError(pack->tempPath, "UPLOAD_ERROR usb_ready\n");
   }
 
   mbedtls_sha256_context hash;
@@ -422,12 +462,12 @@ void installOpenClawFromUsb() {
   bool good = mbedtls_sha256_starts(&hash, 0) == 0;
   size_t received = 0;
   size_t nextAcknowledgement = std::min<size_t>(
-      kCharacterUploadAckBytes, kOpenClawDataSize);
+      kCharacterUploadAckBytes, pack->dataSize);
   uint32_t progress = millis();
   Serial.setTimeout(100);
-  while (good && received < kOpenClawDataSize) {
+  while (good && received < pack->dataSize) {
     const size_t requested = std::min<size_t>(
-        kCharacterUploadAckBytes, kOpenClawDataSize - received);
+        kCharacterUploadAckBytes, pack->dataSize - received);
     const size_t count = Serial.readBytes(
         reinterpret_cast<char*>(transferBuffer), requested);
     if (count) {
@@ -445,7 +485,7 @@ void installOpenClawFromUsb() {
           good = false;
         }
         nextAcknowledgement = std::min<size_t>(
-            nextAcknowledgement + kCharacterUploadAckBytes, kOpenClawDataSize);
+            nextAcknowledgement + kCharacterUploadAckBytes, pack->dataSize);
       }
       yield();
     } else if (millis() - progress > kCharacterUploadTimeoutMs) {
@@ -455,8 +495,8 @@ void installOpenClawFromUsb() {
   uint8_t digest[32] = {};
   const int finishStatus = mbedtls_sha256_finish(&hash, digest);
   const bool digestMatches = finishStatus == 0
-      && std::memcmp(digest, kOpenClawDataSha256, sizeof(digest)) == 0;
-  good = good && received == kOpenClawDataSize && digestMatches;
+      && std::memcmp(digest, pack->dataSha256, sizeof(digest)) == 0;
+  good = good && received == pack->dataSize && digestMatches;
   mbedtls_sha256_free(&hash);
   output.flush();
   output.close();
@@ -467,29 +507,39 @@ void installOpenClawFromUsb() {
       snprintf(digestHex + i * 2, 3, "%02x", digest[i]);
     snprintf(detail, sizeof(detail),
              "UPLOAD_ERROR validation received=%u expected=%u hash=%s finish=%d\n",
-             static_cast<unsigned>(received), static_cast<unsigned>(kOpenClawDataSize),
+             static_cast<unsigned>(received), static_cast<unsigned>(pack->dataSize),
              digestHex, finishStatus);
-    restartAfterUploadError(detail);
+    restartAfterUploadError(pack->tempPath, detail);
   }
 
-  SD_MMC.remove(kOpenClawBackupPath);
-  const bool hadExisting = SD_MMC.exists(kOpenClawSpritePath);
-  if (hadExisting && !SD_MMC.rename(kOpenClawSpritePath, kOpenClawBackupPath))
-    restartAfterUploadError("UPLOAD_ERROR backup\n");
-  if (!SD_MMC.rename(kOpenClawTempPath, kOpenClawSpritePath)) {
-    if (hadExisting) SD_MMC.rename(kOpenClawBackupPath, kOpenClawSpritePath);
-    restartAfterUploadError("UPLOAD_ERROR install\n");
+  SD_MMC.remove(pack->backupPath);
+  const bool hadExisting = SD_MMC.exists(pack->spritePath);
+  if (hadExisting && !SD_MMC.rename(pack->spritePath, pack->backupPath))
+    restartAfterUploadError(pack->tempPath, "UPLOAD_ERROR backup\n");
+  if (!SD_MMC.rename(pack->tempPath, pack->spritePath)) {
+    if (hadExisting) SD_MMC.rename(pack->backupPath, pack->spritePath);
+    restartAfterUploadError(pack->tempPath, "UPLOAD_ERROR install\n");
   }
-  if (hadExisting) SD_MMC.remove(kOpenClawBackupPath);
-  saveCharacter(CharacterId::OpenClaw);
-  sendUploadMessage("UPLOAD_OK character=openclaw rebooting\n");
+  if (hadExisting) SD_MMC.remove(pack->backupPath);
+  saveCharacter(character);
+  char okMessage[48];
+  snprintf(okMessage, sizeof(okMessage), "UPLOAD_OK character=%s rebooting\n", characterName(character));
+  sendUploadMessage(okMessage);
   delay(250);
   ESP.restart();
 }
 
 void queueCharacter(CharacterId character, CharacterMode resumeMode) {
-  if (character == CharacterId::OpenClaw && !openClawAvailable()) {
-    logMessage("CHARACTER unavailable=openclaw\n");
+  // Loading is idempotent if this character's pack is already resident, and
+  // clears PSRAM held by a previous SD pack when switching to Copilot (which
+  // has none). This blocks the calling (UI/touch) thread for the duration of
+  // SD verification on first selection of a given SD-backed character; the
+  // render task keeps producing frames on the still-active character
+  // meanwhile, so this does not risk the render-stall watchdog in loop().
+  loadSdCharacterPack(character);
+  if ((character == CharacterId::OpenClaw || character == CharacterId::Jarvis)
+      && !sdCharacterAvailable()) {
+    logMessage("CHARACTER unavailable=%s\n", characterName(character));
     return;
   }
   const ModeRequest request{resumeMode, false, static_cast<int8_t>(character)};
@@ -588,9 +638,19 @@ void drawSettingsMenu(CharacterMode selected) {
   display.print("Character");
   const CharacterId character = static_cast<CharacterId>(
       selectedCharacter.load(std::memory_order_relaxed));
-  drawSettingsButton(58, 244, 165, "Copilot", character == CharacterId::Copilot, 2, 34);
-  drawSettingsButton(243, 244, 165, openClawAvailable() ? "OpenClaw" : "No SD pack",
-                     character == CharacterId::OpenClaw, openClawAvailable() ? 2 : 1, 34);
+  drawSettingsButton(58, 244, 108, "Copilot", character == CharacterId::Copilot, 2, 34);
+  // Under the lazy single-pack-slot design, sdCharacterAvailable() only knows
+  // about whichever pack is currently loaded, not "is OpenClaw/Jarvis's own
+  // pack present" in the abstract (that would require attempting a full load
+  // just to draw a button). So only the currently-selected SD character can
+  // be shown as definitively unavailable; the other is shown optimistically
+  // and queueCharacter() will attempt and gracefully fail on an actual tap.
+  const bool openClawKnownBad = character == CharacterId::OpenClaw && !sdCharacterAvailable();
+  drawSettingsButton(179, 244, 108, openClawKnownBad ? "No SD pack" : "OpenClaw",
+                     character == CharacterId::OpenClaw, openClawKnownBad ? 1 : 2, 34);
+  const bool jarvisKnownBad = character == CharacterId::Jarvis && !sdCharacterAvailable();
+  drawSettingsButton(300, 244, 108, jarvisKnownBad ? "No SD pack" : "Jarvis",
+                     character == CharacterId::Jarvis, jarvisKnownBad ? 1 : 2, 34);
   display.setTextColor(text);
   display.setTextSize(2);
   display.setCursor(143, 286);
@@ -671,6 +731,11 @@ void handleTouchGesture(const TouchGesture& gesture, const Frame& frame) {
       queueAudioCue(AudioCue::Settings);
       drawSettingsMenu(frame.state.requestedMode);
       break;
+    case SettingsAction::CharacterJarvis:
+      queueCharacter(CharacterId::Jarvis, frame.state.requestedMode);
+      queueAudioCue(AudioCue::Settings);
+      drawSettingsMenu(frame.state.requestedMode);
+      break;
     case SettingsAction::Idle:
       closeSettings("mode"); queueMode(DeviceCommand::Idle); break;
     case SettingsAction::Surprise:
@@ -718,7 +783,10 @@ void processCommand(DeviceCommand command, const Frame& frame) {
       logSdStatus(sdSpriteStatus());
       break;
     case DeviceCommand::UploadOpenClaw:
-      installOpenClawFromUsb();
+      installSdCharacterFromUsb(CharacterId::OpenClaw);
+      break;
+    case DeviceCommand::UploadJarvis:
+      installSdCharacterFromUsb(CharacterId::Jarvis);
       break;
     default: queueMode(command); break;
   }
@@ -738,12 +806,12 @@ void setup() {
   display.setBrightness(0);
   display.fillScreen(0);
   if (!initializeSpriteStorage()) fatal(spriteStorageError());
-  initializeSdSpriteStorage();
   if (!initializeTouchInput()) fatal(touchInputError());
   const uint8_t storedSoundVolume = loadSoundVolume();
   settings.setSoundVolume(storedSoundVolume);
   setSoundVolume(storedSoundVolume);
   beginAudio();
+  // Loads the saved character's SD pack (if it needs one) as a side effect.
   const CharacterId storedCharacter = loadCharacter();
   activeCharacter.store(static_cast<uint8_t>(storedCharacter), std::memory_order_relaxed);
   selectedCharacter.store(static_cast<uint8_t>(storedCharacter), std::memory_order_relaxed);
@@ -766,6 +834,14 @@ void setup() {
   auto* openClawCached = static_cast<uint16_t*>(allocate(
       kCharacterFrameWidth * kCharacterFrameHeight * sizeof(uint16_t), MALLOC_CAP_SPIRAM,
       "OpenClaw decoded frame cache allocation failed."));
+  void* jarvisMemory = allocate(
+      sizeof(JarvisSpriteRenderer), MALLOC_CAP_INTERNAL, "Jarvis renderer allocation failed.");
+  auto* jarvisScratch = static_cast<uint16_t*>(allocate(
+      kCharacterFrameWidth * kFrameHeight * sizeof(uint16_t), MALLOC_CAP_SPIRAM,
+      "Jarvis blink buffer allocation failed."));
+  auto* jarvisCached = static_cast<uint16_t*>(allocate(
+      kCharacterFrameWidth * kCharacterFrameHeight * sizeof(uint16_t), MALLOC_CAP_SPIRAM,
+      "Jarvis decoded frame cache allocation failed."));
   freeFrames = xQueueCreate(2, sizeof(Frame*));
   readyFrames = xQueueCreate(2, sizeof(Frame*));
   commands = xQueueCreate(8, sizeof(ModeRequest));
@@ -782,15 +858,20 @@ void setup() {
                                                 kCharacterFrameWidth, kCharacterFrameHeight);
   openClawRenderer = new (openClawMemory) OpenClawSpriteRenderer(
       openClawScratch, openClawCached, inflatePose);
+  jarvisRenderer = new (jarvisMemory) JarvisSpriteRenderer(
+      jarvisScratch, jarvisCached, inflatePose);
   void* effectMemory = allocate(sizeof(CharacterEffects), MALLOC_CAP_INTERNAL, "Effects allocation failed.");
   effects = new (effectMemory) CharacterEffects(frames[0].pixels, frames[1].pixels);
   // Warm both frame caches before starting the presentation clock and brightness fade.
   for (auto& frame : frames) {
     const bool rendered = storedCharacter == CharacterId::OpenClaw
         ? openClawRenderer->render({0, 0, 0}, 0, frame.pixels)
+        : storedCharacter == CharacterId::Jarvis
+        ? jarvisRenderer->render({0, 0, 0}, 0, frame.pixels)
         : copilotRenderer->render({0, 0, 0}, frame.pixels);
-    if (!rendered) fatal(storedCharacter == CharacterId::OpenClaw
-        ? openClawRenderer->error() : copilotRenderer->error());
+    if (!rendered) fatal(storedCharacter == CharacterId::OpenClaw ? openClawRenderer->error()
+        : storedCharacter == CharacterId::Jarvis ? jarvisRenderer->error()
+        : copilotRenderer->error());
   }
   if (xTaskCreatePinnedToCore(animate, "copilot-render", 16384, nullptr, 1,
                               &renderTask, 0) != pdPASS) fatal("Render task creation failed.");

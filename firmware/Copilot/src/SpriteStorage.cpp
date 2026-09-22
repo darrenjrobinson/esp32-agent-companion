@@ -2,6 +2,7 @@
 #include "Config.h"
 #include "../generated/sprite_assets.h"
 #include "../generated/openclaw_assets.h"
+#include "../generated/jarvis_assets.h"
 #ifdef ARDUINO_ARCH_ESP32
 #include "SpriteBlockCache.h"
 #include <Arduino.h>
@@ -16,12 +17,54 @@
 
 #ifndef ARDUINO_ARCH_ESP32
 extern "C" const uint8_t kOpenClawDataBlob[];
+extern "C" const uint8_t kJarvisDataBlob[];
 #endif
 
 namespace copilot {
 namespace {
 const char* error = nullptr;
 SdSpriteStatus sdStatus{"not_initialized", "Using built-in Copilot assets.", "none", 0, 0, 0, 0, 0};
+
+struct SdCharacterPack {
+  const char* path;
+  const char* tempPath;
+  const char* backupPath;
+  uint32_t dataSize;
+  uint32_t openDataSize;
+  const uint8_t* dataSha256;
+#ifndef ARDUINO_ARCH_ESP32
+  const uint8_t* hostBlob;
+#endif
+};
+
+#ifndef ARDUINO_ARCH_ESP32
+constexpr SdCharacterPack kOpenClawPack{
+    kOpenClawSpritePath, kOpenClawTempPath, kOpenClawBackupPath,
+    kOpenClawDataSize, kOpenClawOpenDataSize, kOpenClawDataSha256, kOpenClawDataBlob};
+constexpr SdCharacterPack kJarvisPack{
+    kJarvisSpritePath, kJarvisTempPath, kJarvisBackupPath,
+    kJarvisDataSize, kJarvisOpenDataSize, kJarvisDataSha256, kJarvisDataBlob};
+#else
+constexpr SdCharacterPack kOpenClawPack{
+    kOpenClawSpritePath, kOpenClawTempPath, kOpenClawBackupPath,
+    kOpenClawDataSize, kOpenClawOpenDataSize, kOpenClawDataSha256};
+constexpr SdCharacterPack kJarvisPack{
+    kJarvisSpritePath, kJarvisTempPath, kJarvisBackupPath,
+    kJarvisDataSize, kJarvisOpenDataSize, kJarvisDataSha256};
+#endif
+
+const SdCharacterPack* packFor(CharacterId character) {
+  switch (character) {
+    case CharacterId::OpenClaw: return &kOpenClawPack;
+    case CharacterId::Jarvis: return &kJarvisPack;
+    default: return nullptr;
+  }
+}
+
+// Whichever SD-streamed character's pack is currently resident, if any.
+const SdCharacterPack* activePack = nullptr;
+uint32_t activeOpenDataSize = 0;
+
 #ifdef ARDUINO_ARCH_ESP32
 esp_partition_mmap_handle_t mapping;
 portMUX_TYPE cacheLock = portMUX_INITIALIZER_UNLOCKED;
@@ -29,7 +72,7 @@ SpriteBlockCache* cache = nullptr;
 alignas(SpriteBlockCache) uint8_t cacheObject[sizeof(SpriteBlockCache)];
 uint8_t* cacheMemory = nullptr;
 uint8_t* readScratch = nullptr;
-uint8_t* openClawOpenData = nullptr;
+uint8_t* activeOpenData = nullptr;
 QueueHandle_t readJobs = nullptr;
 SemaphoreHandle_t readerStopped = nullptr;
 File packFile;
@@ -78,8 +121,30 @@ void loadPages(void*) {
     portENTER_CRITICAL(&cacheLock);
     cache->complete(slot, good);
     portEXIT_CRITICAL(&cacheLock);
-    if (!good) failReads("OpenClaw card read failed; returning to built-in Copilot. Restart to retry.");
+    if (!good) failReads("SD character card read failed; returning to built-in Copilot. Restart to retry.");
   }
+}
+
+// Frees every resource for the currently resident pack, if any. Safe to call
+// when nothing is loaded.
+void closeActivePack() {
+  if (!activePack) return;
+  if (readerTask) {
+    xQueueReset(readJobs);
+    const int stop = -1;
+    xQueueSend(readJobs, &stop, portMAX_DELAY);
+    xSemaphoreTake(readerStopped, portMAX_DELAY);
+    readerTask = nullptr;
+  }
+  if (readJobs) { vQueueDelete(readJobs); readJobs = nullptr; }
+  if (readerStopped) { vSemaphoreDelete(readerStopped); readerStopped = nullptr; }
+  if (cache) { cache->~SpriteBlockCache(); cache = nullptr; }
+  if (cacheMemory) { heap_caps_free(cacheMemory); cacheMemory = nullptr; }
+  if (readScratch) { heap_caps_free(readScratch); readScratch = nullptr; }
+  if (activeOpenData) { heap_caps_free(activeOpenData); activeOpenData = nullptr; }
+  packFile.close();
+  activePack = nullptr;
+  activeOpenDataSize = 0;
 }
 #endif
 }
@@ -131,36 +196,50 @@ SdSpriteStatus sdSpriteStatus() {
 #endif
 }
 
-void initializeSdSpriteStorage() {
+void loadSdCharacterPack(CharacterId character) {
+  const SdCharacterPack* pack = packFor(character);
 #ifdef ARDUINO_ARCH_ESP32
-  if (sdInitialized) return;
+  if (pack == activePack) return;
+  closeActivePack();
+  if (!pack) {
+    storageState("not_initialized", "Using built-in Copilot assets.");
+    return;
+  }
+  // An unfilled slot has no pack compiled in. Say so plainly rather than
+  // mounting the card and reporting a missing file.
+  if (!pack->dataSize) {
+    storageState("slot_empty", "No character is built into this slot; see docs/character-art-notes.md.");
+    return;
+  }
   sdInitialized = true;
-  if (!SD_MMC.setPins(kSdClock, kSdCommand, kSdData)) {
-    storageState("unavailable", "SD_MMC pin configuration failed; using flash.");
-    return;
+  if (!sdMounted) {
+    if (!SD_MMC.setPins(kSdClock, kSdCommand, kSdData)) {
+      storageState("unavailable", "SD_MMC pin configuration failed; using flash.");
+      return;
+    }
+    if (!SD_MMC.begin("/sdcard", true, false, kSdFrequencyKhz, 2)) {
+      SD_MMC.end();
+      storageState("mount_failed", "Card absent or filesystem could not mount; no formatting attempted.");
+      return;
+    }
+    const auto type = SD_MMC.cardType();
+    if (type == CARD_NONE) {
+      SD_MMC.end();
+      storageState("mount_failed", "No card detected; using flash.");
+      return;
+    }
+    sdStatus.cardType = type == CARD_MMC ? "mmc" : type == CARD_SD ? "sdsc" : "sdhc_sdxc";
+    sdStatus.capacityBytes = SD_MMC.cardSize();
+    sdMounted = true;
   }
-  if (!SD_MMC.begin("/sdcard", true, false, kSdFrequencyKhz, 2)) {
-    SD_MMC.end();
-    storageState("mount_failed", "Card absent or filesystem could not mount; no formatting attempted.");
-    return;
-  }
-  const auto type = SD_MMC.cardType();
-  if (type == CARD_NONE) {
-    SD_MMC.end();
-    storageState("mount_failed", "No card detected; using flash.");
-    return;
-  }
-  sdStatus.cardType = type == CARD_MMC ? "mmc" : type == CARD_SD ? "sdsc" : "sdhc_sdxc";
-  sdStatus.capacityBytes = SD_MMC.cardSize();
-  sdMounted = true;
-  packFile = SD_MMC.open(kOpenClawSpritePath, FILE_READ);
+  packFile = SD_MMC.open(pack->path, FILE_READ);
   if (!packFile) {
-    storageState("pack_missing", "Card mounted; copy OpenClaw to /characters/openclaw/sprites.bin.");
+    storageState("pack_missing", "Card mounted; copy this character's pack to its SD path.");
     return;
   }
-  if (packFile.isDirectory() || packFile.size() != kOpenClawDataSize) {
+  if (packFile.isDirectory() || packFile.size() != pack->dataSize) {
     packFile.close();
-    storageState("pack_invalid", "OpenClaw pack size does not match this firmware; using Copilot.");
+    storageState("pack_invalid", "SD pack size does not match this firmware; using Copilot.");
     return;
   }
   readScratch = static_cast<uint8_t*>(heap_caps_malloc(kSdReadChunkBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
@@ -169,13 +248,13 @@ void initializeSdSpriteStorage() {
     storageState("unavailable", "Cannot allocate SD read buffer; using flash.");
     return;
   }
-  openClawOpenData = static_cast<uint8_t*>(
-      heap_caps_malloc(kOpenClawOpenDataSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  if (!openClawOpenData) {
+  activeOpenData = static_cast<uint8_t*>(
+      heap_caps_malloc(pack->openDataSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!activeOpenData) {
     packFile.close();
     heap_caps_free(readScratch);
     readScratch = nullptr;
-    storageState("unavailable", "Cannot allocate OpenClaw hot-frame cache; using Copilot.");
+    storageState("unavailable", "Cannot allocate SD hot-frame cache; using Copilot.");
     return;
   }
   mbedtls_sha256_context hash;
@@ -183,14 +262,14 @@ void initializeSdSpriteStorage() {
   bool good = mbedtls_sha256_starts(&hash, 0) == 0;
   const uint32_t started = millis();
   size_t read = 0;
-  while (good && read < kOpenClawDataSize) {
-    const size_t bytes = std::min<size_t>(kSdReadChunkBytes, kOpenClawDataSize - read);
+  while (good && read < pack->dataSize) {
+    const size_t bytes = std::min<size_t>(kSdReadChunkBytes, pack->dataSize - read);
     good = packFile.read(readScratch, bytes) == bytes;
     good = good && mbedtls_sha256_update(&hash, readScratch, bytes) == 0;
     good = good && millis() - started <= kSdVerifyTimeoutMs;
-    if (good && read < kOpenClawOpenDataSize) {
-      const size_t cachedBytes = std::min<size_t>(bytes, kOpenClawOpenDataSize - read);
-      std::memcpy(openClawOpenData + read, readScratch, cachedBytes);
+    if (good && read < pack->openDataSize) {
+      const size_t cachedBytes = std::min<size_t>(bytes, pack->openDataSize - read);
+      std::memcpy(activeOpenData + read, readScratch, cachedBytes);
     }
     read += bytes;
     yield();
@@ -198,19 +277,19 @@ void initializeSdSpriteStorage() {
   uint8_t digest[32];
   good = good && mbedtls_sha256_finish(&hash, digest) == 0;
   mbedtls_sha256_free(&hash);
-  good = good && std::memcmp(digest, kOpenClawDataSha256, sizeof(digest)) == 0;
+  good = good && std::memcmp(digest, pack->dataSha256, sizeof(digest)) == 0;
   if (!good) {
     packFile.close();
     heap_caps_free(readScratch);
     readScratch = nullptr;
-    heap_caps_free(openClawOpenData);
-    openClawOpenData = nullptr;
-    storageState("pack_invalid", "OpenClaw pack read, timeout, or SHA256 check failed; using Copilot.");
+    heap_caps_free(activeOpenData);
+    activeOpenData = nullptr;
+    storageState("pack_invalid", "SD pack read, timeout, or SHA256 check failed; using Copilot.");
     return;
   }
   constexpr size_t cacheBytes = kSpriteCacheSlots * kSpriteCacheWindowBytes;
   cacheMemory = static_cast<uint8_t*>(heap_caps_malloc(cacheBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  if (cacheMemory) cache = new (cacheObject) SpriteBlockCache(cacheMemory, cacheBytes, kOpenClawDataSize);
+  if (cacheMemory) cache = new (cacheObject) SpriteBlockCache(cacheMemory, cacheBytes, pack->dataSize);
   if (cache && cache->valid()) {
     readJobs = xQueueCreate(kSpriteCacheSlots, sizeof(int));
     readerStopped = xSemaphoreCreateBinary();
@@ -227,15 +306,19 @@ void initializeSdSpriteStorage() {
     cacheMemory = nullptr;
     heap_caps_free(readScratch);
     readScratch = nullptr;
-    heap_caps_free(openClawOpenData);
-    openClawOpenData = nullptr;
+    heap_caps_free(activeOpenData);
+    activeOpenData = nullptr;
     packFile.close();
-    storageState("unavailable", "Cannot allocate OpenClaw SD cache or reader task; using Copilot.");
+    storageState("unavailable", "Cannot allocate SD cache or reader task; using Copilot.");
     return;
   }
+  activePack = pack;
+  activeOpenDataSize = pack->openDataSize;
   sdStatus.cacheBytes = cacheBytes;
-  storageState("ready", "Verified OpenClaw SD pack; open-eye frames resident in PSRAM.");
+  storageState("ready", "Verified SD character pack; open-eye frames resident in PSRAM.");
 #else
+  activePack = pack;
+  activeOpenDataSize = pack ? pack->openDataSize : 0;
   sdStatus.state = "host";
   sdStatus.detail = "Native preview uses the verified embedded assets.";
   ++sdStatus.revision;
@@ -260,18 +343,18 @@ void releaseSpriteBlock(const SpriteBlockLease& block) {
 #endif
 }
 
-bool openClawAvailable() {
+bool sdCharacterAvailable() {
 #ifdef ARDUINO_ARCH_ESP32
   portENTER_CRITICAL(&cacheLock);
-  const bool available = cache && cache->valid();
+  const bool available = activePack && cache && cache->valid();
   portEXIT_CRITICAL(&cacheLock);
   return available;
 #else
-  return true;
+  return activePack != nullptr && activePack->dataSize != 0;
 #endif
 }
 
-bool prepareOpenClawUpdate() {
+bool prepareSdCharacterUpdate() {
 #ifdef ARDUINO_ARCH_ESP32
   if (!sdMounted) return false;
   portENTER_CRITICAL(&cacheLock);
@@ -284,30 +367,30 @@ bool prepareOpenClawUpdate() {
     const TickType_t timeout = pdMS_TO_TICKS(kSdReaderStopTimeoutMs);
     if (xQueueSend(readJobs, &stop, timeout) != pdTRUE
         || xSemaphoreTake(readerStopped, timeout) != pdTRUE) {
-      storageState("shutdown_timeout", "OpenClaw SD reader did not stop; update aborted.");
+      storageState("shutdown_timeout", "SD reader did not stop; update aborted.");
       return false;
     }
     readerTask = nullptr;
   }
   packFile.close();
-  storageState("updating", "Receiving a validated OpenClaw pack over USB.");
+  storageState("updating", "Receiving a validated character pack over USB.");
   return true;
 #else
   return false;
 #endif
 }
 
-SpriteBlockLease acquireOpenClawBlock(size_t offset, size_t bytes) {
-  if (!bytes || offset > kOpenClawDataSize || bytes > kOpenClawDataSize - offset)
+SpriteBlockLease acquireSdCharacterBlock(size_t offset, size_t bytes) {
+  if (!activePack || !bytes || offset > activePack->dataSize || bytes > activePack->dataSize - offset)
     return {nullptr, -1};
 #ifdef ARDUINO_ARCH_ESP32
   portENTER_CRITICAL(&cacheLock);
-  const bool useOpenData = !storageUpdating && openClawOpenData
-      && offset <= kOpenClawOpenDataSize && bytes <= kOpenClawOpenDataSize - offset;
+  const bool useOpenData = !storageUpdating && activeOpenData
+      && offset <= activeOpenDataSize && bytes <= activeOpenDataSize - offset;
   if (useOpenData) {
     ++sdStatus.hits;
     portEXIT_CRITICAL(&cacheLock);
-    return {openClawOpenData + offset, -1};
+    return {activeOpenData + offset, -1};
   }
   portEXIT_CRITICAL(&cacheLock);
   const uint32_t started = millis();
@@ -328,24 +411,24 @@ SpriteBlockLease acquireOpenClawBlock(size_t offset, size_t bytes) {
       portENTER_CRITICAL(&cacheLock);
       cache->complete(result.slot, false);
       portEXIT_CRITICAL(&cacheLock);
-      storageState("queue_full", "OpenClaw SD read queue is full; returning to Copilot.");
+      storageState("queue_full", "SD read queue is full; returning to Copilot.");
       break;
     }
     vTaskDelay(1);
   }
   return {nullptr, -1};
 #else
-  return {::kOpenClawDataBlob + offset, -1};
+  return {activePack->hostBlob + offset, -1};
 #endif
 }
 
-void prefetchOpenClawBlock(size_t offset, size_t bytes) {
+void prefetchSdCharacterBlock(size_t offset, size_t bytes) {
 #ifdef ARDUINO_ARCH_ESP32
-  if (!bytes || offset > kOpenClawDataSize || bytes > kOpenClawDataSize - offset)
+  if (!activePack || !bytes || offset > activePack->dataSize || bytes > activePack->dataSize - offset)
     return;
   portENTER_CRITICAL(&cacheLock);
-  const bool useOpenData = !storageUpdating && openClawOpenData
-      && offset <= kOpenClawOpenDataSize && bytes <= kOpenClawOpenDataSize - offset;
+  const bool useOpenData = !storageUpdating && activeOpenData
+      && offset <= activeOpenDataSize && bytes <= activeOpenDataSize - offset;
   if (useOpenData) {
     portEXIT_CRITICAL(&cacheLock);
     return;
@@ -365,7 +448,7 @@ void prefetchOpenClawBlock(size_t offset, size_t bytes) {
 #endif
 }
 
-void releaseOpenClawBlock(const SpriteBlockLease& block) {
+void releaseSdCharacterBlock(const SpriteBlockLease& block) {
   releaseSpriteBlock(block);
 }
 }

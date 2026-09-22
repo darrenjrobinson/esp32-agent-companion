@@ -4,6 +4,7 @@
 #include "../firmware/Copilot/src/SpriteStorage.h"
 #include "HostSpriteInflate.h"
 #include "../firmware/Copilot/src/OpenClawSpriteRenderer.h"
+#include "../firmware/Copilot/src/JarvisSpriteRenderer.h"
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -23,12 +24,16 @@ int main() {
   std::vector<uint16_t> patch(kSpriteMaxPatchPixels);
   std::vector<uint16_t> openClawScratch(kCharacterFrameWidth * kFrameHeight);
   std::vector<uint16_t> openClawCached(kCharacterFrameWidth * kCharacterFrameHeight);
+  std::vector<uint16_t> jarvisScratch(kCharacterFrameWidth * kFrameHeight);
+  std::vector<uint16_t> jarvisCached(kCharacterFrameWidth * kCharacterFrameHeight);
   SpriteRenderer renderer(openFirst.data(), openSecond.data(), patch.data(),
                           first.data(), second.data(), inflateSpriteHost,
                           kCharacterFrameWidth, kCharacterFrameHeight);
   CharacterEffects effects(first.data(), second.data());
   OpenClawSpriteRenderer openClaw(
       openClawScratch.data(), openClawCached.data(), inflateSpriteHost);
+  JarvisSpriteRenderer jarvis(
+      jarvisScratch.data(), jarvisCached.data(), inflateSpriteHost);
   CharacterMotion motion(20260911);
   if (motion.error()) {
     std::cerr << motion.error() << '\n';
@@ -46,7 +51,8 @@ int main() {
         || !std::isfinite(requestedMode) || requestedMode < -1 || requestedMode > 5
         || std::floor(requestedMode) != requestedMode
         || !std::isfinite(requestedPlaying) || (requestedPlaying != 0 && requestedPlaying != 1)
-        || !std::isfinite(requestedCharacter) || (requestedCharacter != 0 && requestedCharacter != 1)
+        || !std::isfinite(requestedCharacter)
+        || (requestedCharacter != 0 && requestedCharacter != 1 && requestedCharacter != 2)
         || !std::isfinite(requestedDirection) || requestedDirection < -1 || requestedDirection > 7
         || std::floor(requestedDirection) != requestedDirection) {
       std::cout << "ERR Invalid character command\n" << std::flush;
@@ -54,6 +60,8 @@ int main() {
     }
     const int mode = static_cast<int>(requestedMode), playing = static_cast<int>(requestedPlaying);
     const int character = static_cast<int>(requestedCharacter);
+    loadSdCharacterPack(character == 1 ? CharacterId::OpenClaw
+                        : character == 2 ? CharacterId::Jarvis : CharacterId::Copilot);
     if (mode >= 0 && !motion.setMode(static_cast<CharacterMode>(mode))) {
       std::cout << "ERR " << motion.error() << '\n' << std::flush;
       continue;
@@ -70,9 +78,11 @@ int main() {
     const auto start = std::chrono::steady_clock::now();
     const bool restored = effects.restore(frame);
     const bool rendered = character == 0 ? renderer.render(state.pose, frame)
-                                         : openClaw.render(state.pose, state.effectSeconds, frame);
+                          : character == 1 ? openClaw.render(state.pose, state.effectSeconds, frame)
+                                           : jarvis.render(state.pose, state.effectSeconds, frame);
     if (!restored || !rendered || !effects.render(state, frame)) {
-      const char* renderError = character == 0 ? renderer.error() : openClaw.error();
+      const char* renderError = character == 0 ? renderer.error()
+                                : character == 1 ? openClaw.error() : jarvis.error();
       std::cout << "ERR " << (effects.error() ? effects.error() : renderError) << '\n' << std::flush;
       continue;
     }
