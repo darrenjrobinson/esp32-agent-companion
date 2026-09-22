@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 import select
 import subprocess
+import sys
 import threading
 import time
 
@@ -16,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def build_renderer():
-    subprocess.run(["python3", str(ROOT / "tools/embed_atlas.py")], check=True)
+    subprocess.run([sys.executable, str(ROOT / "tools/embed_atlas.py")], check=True)
     sources = ROOT / "firmware/Copilot/src"
     executable = ROOT / "build/live-preview"
     subprocess.run([

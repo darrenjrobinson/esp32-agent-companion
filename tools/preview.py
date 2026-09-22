@@ -3,6 +3,7 @@
 from pathlib import Path
 import subprocess
 import re
+import sys
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -25,7 +26,7 @@ FRAMES = FPS * 18
 
 def main():
     BUILD.mkdir(exist_ok=True)
-    subprocess.run(["python3", str(ROOT / "tools/embed_atlas.py")], check=True)
+    subprocess.run([sys.executable, str(ROOT / "tools/embed_atlas.py")], check=True)
     sources = ROOT / "firmware/Copilot/src"
     subprocess.run([
         "clang++", "-std=c++17", "-O3", "-Wall", "-Wextra", "-Werror",
